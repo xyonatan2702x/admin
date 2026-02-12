@@ -22,14 +22,14 @@
     </script>
 
     <!-- React & ReactDOM -->
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 
     <!-- Babel for JSX -->
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 
     <!-- Lucide Icons -->
-    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lucide/0.344.0/lucide.min.js"></script>
 
     <!-- Firebase -->
     <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
@@ -148,7 +148,39 @@
     </style>
 </head>
 <body>
-    <div id="root"></div>
+    <div id="root">
+        <!-- Loading screen - visible until React mounts -->
+        <div id="loading-screen" style="min-height:100vh;background:#030712;display:flex;align-items:center;justify-content:center;flex-direction:column;font-family:Segoe UI,Tahoma,Arial,sans-serif;">
+            <div style="width:60px;height:60px;border:3px solid rgba(255,255,255,0.1);border-top-color:#818cf8;border-radius:50%;animation:sp .8s linear infinite;"></div>
+            <p style="color:#9ca3af;margin-top:20px;font-size:14px;">טוען לוח בקרה...</p>
+            <p id="load-error" style="color:#ef4444;margin-top:12px;font-size:12px;display:none;max-width:400px;text-align:center;padding:0 20px;"></p>
+            <style>@keyframes sp{to{transform:rotate(360deg)}}</style>
+        </div>
+    </div>
+
+    <script>
+        // Check if critical scripts loaded
+        window.addEventListener('load', function() {
+            setTimeout(function() {
+                var root = document.getElementById('root');
+                var loadScreen = document.getElementById('loading-screen');
+                if (loadScreen && root.children.length <= 1) {
+                    var err = document.getElementById('load-error');
+                    var missing = [];
+                    if (typeof React === 'undefined') missing.push('React');
+                    if (typeof ReactDOM === 'undefined') missing.push('ReactDOM');
+                    if (typeof Babel === 'undefined') missing.push('Babel');
+                    if (typeof lucide === 'undefined') missing.push('Lucide Icons');
+                    if (missing.length > 0) {
+                        err.textContent = 'Scripts blocked: ' + missing.join(', ') + '. Try disabling AdBlock for this site.';
+                    } else {
+                        err.textContent = 'Check browser console (F12) for errors.';
+                    }
+                    err.style.display = 'block';
+                }
+            }, 5000);
+        });
+    </script>
 
     <script>
         // =============================================
