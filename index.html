@@ -31,6 +31,11 @@
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
 
+    <!-- Firebase -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+
     <style>
         * {
             -webkit-tap-highlight-color: transparent;
@@ -73,13 +78,22 @@
             animation: fade-in 0.3s ease-out;
         }
 
-        @keyframes slide-in-right {
-            from { transform: translateX(100%); }
-            to { transform: translateX(0); }
+        @keyframes spin-slow {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
         }
 
-        .slide-in-right {
-            animation: slide-in-right 0.3s ease-out;
+        .spin-slow {
+            animation: spin-slow 1.5s linear infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .pulse-dot {
+            animation: pulse-dot 1.5s ease-in-out infinite;
         }
 
         /* Custom scrollbar */
@@ -106,12 +120,6 @@
             border-right: 3px solid #818cf8;
         }
 
-        /* Priority colors */
-        .priority-urgent { border-right-color: #ef4444; }
-        .priority-high { border-right-color: #f97316; }
-        .priority-medium { border-right-color: #eab308; }
-        .priority-low { border-right-color: #22c55e; }
-
         /* Checkbox animation */
         .task-checkbox {
             transition: all 0.2s ease;
@@ -123,17 +131,6 @@
 
         .task-checkbox.checked {
             background: linear-gradient(135deg, #22c55e, #16a34a);
-        }
-
-        /* Drag handle */
-        .drag-handle {
-            cursor: grab;
-            opacity: 0.3;
-            transition: opacity 0.2s;
-        }
-
-        .drag-handle:hover {
-            opacity: 0.7;
         }
 
         /* Mobile bottom nav */
@@ -152,8 +149,178 @@
 </head>
 <body>
     <div id="root"></div>
+
+    <script>
+        // =============================================
+        // FIREBASE CONFIGURATION
+        // Replace these values with your Firebase project config
+        // Instructions: See SETUP.md or follow the setup screen
+        // =============================================
+        const FIREBASE_CONFIG = {
+            apiKey: "",
+            authDomain: "",
+            projectId: "",
+            storageBucket: "",
+            messagingSenderId: "",
+            appId: ""
+        };
+
+        // Initialize Firebase (only if configured)
+        let db = null;
+        let auth = null;
+        let firebaseReady = false;
+
+        if (FIREBASE_CONFIG.apiKey) {
+            try {
+                const app = firebase.initializeApp(FIREBASE_CONFIG);
+                db = firebase.firestore();
+                auth = firebase.auth();
+                firebaseReady = true;
+
+                // Enable offline persistence
+                db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
+            } catch (e) {
+                console.error('Firebase init error:', e);
+            }
+        }
+    </script>
+
     <script type="text/babel">
-        const { useState, useEffect, useRef, useCallback, useMemo } = React;
+        const { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } = React;
+
+        // ===== AUTH CONTEXT =====
+        const AuthContext = createContext(null);
+
+        function useAuth() {
+            return useContext(AuthContext);
+        }
+
+        function AuthProvider({ children }) {
+            const [user, setUser] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [syncing, setSyncing] = useState(false);
+
+            useEffect(() => {
+                if (!firebaseReady) {
+                    setLoading(false);
+                    return;
+                }
+
+                const unsubscribe = auth.onAuthStateChanged((firebaseUser) => {
+                    setUser(firebaseUser);
+                    setLoading(false);
+                });
+
+                return () => unsubscribe();
+            }, []);
+
+            const signInWithGoogle = async () => {
+                if (!firebaseReady) return;
+                const provider = new firebase.auth.GoogleAuthProvider();
+                provider.setCustomParameters({ prompt: 'select_account' });
+                try {
+                    await auth.signInWithPopup(provider);
+                } catch (e) {
+                    if (e.code !== 'auth/popup-closed-by-user') {
+                        console.error('Sign in error:', e);
+                        alert('שגיאה בהתחברות: ' + e.message);
+                    }
+                }
+            };
+
+            const signOut = async () => {
+                if (!firebaseReady) return;
+                await auth.signOut();
+            };
+
+            return (
+                <AuthContext.Provider value={{ user, loading, syncing, setSyncing, signInWithGoogle, signOut, firebaseReady }}>
+                    {children}
+                </AuthContext.Provider>
+            );
+        }
+
+        // ===== FIRESTORE SYNC HOOK =====
+        function useFirestoreSync(collectionName, localStorageKey, defaultValue) {
+            const { user, firebaseReady, setSyncing } = useAuth();
+
+            const [data, setData] = useState(() => {
+                const saved = localStorage.getItem(localStorageKey);
+                return saved ? JSON.parse(saved) : defaultValue;
+            });
+
+            const isFirstLoad = useRef(true);
+            const unsubRef = useRef(null);
+
+            // Save to localStorage always
+            useEffect(() => {
+                localStorage.setItem(localStorageKey, JSON.stringify(data));
+            }, [data, localStorageKey]);
+
+            // Subscribe to Firestore when logged in
+            useEffect(() => {
+                if (!firebaseReady || !user || !db) return;
+
+                const docRef = db.collection('users').doc(user.uid).collection('data').doc(collectionName);
+
+                unsubRef.current = docRef.onSnapshot((snap) => {
+                    if (snap.exists) {
+                        const remoteData = snap.data().value;
+                        if (isFirstLoad.current) {
+                            // On first load, merge: prefer remote if it has data
+                            if (remoteData && (Array.isArray(remoteData) ? remoteData.length > 0 : Object.keys(remoteData).length > 0)) {
+                                setData(remoteData);
+                            } else {
+                                // Remote is empty, push local data up
+                                docRef.set({ value: data, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                            }
+                            isFirstLoad.current = false;
+                        } else {
+                            setData(remoteData);
+                        }
+                    } else if (isFirstLoad.current) {
+                        // No remote doc, push local data
+                        docRef.set({ value: data, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+                        isFirstLoad.current = false;
+                    }
+                }, (err) => {
+                    console.error('Firestore listen error:', err);
+                });
+
+                return () => {
+                    if (unsubRef.current) unsubRef.current();
+                    isFirstLoad.current = true;
+                };
+            }, [user, firebaseReady, collectionName]);
+
+            // Write to Firestore on data change (debounced)
+            const timeoutRef = useRef(null);
+
+            const setDataAndSync = useCallback((newDataOrFn) => {
+                setData((prev) => {
+                    const newData = typeof newDataOrFn === 'function' ? newDataOrFn(prev) : newDataOrFn;
+
+                    // Debounced sync to Firestore
+                    if (firebaseReady && user && db && !isFirstLoad.current) {
+                        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+                        timeoutRef.current = setTimeout(() => {
+                            setSyncing(true);
+                            const docRef = db.collection('users').doc(user.uid).collection('data').doc(collectionName);
+                            docRef.set({
+                                value: newData,
+                                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                            }).then(() => {
+                                setTimeout(() => setSyncing(false), 500);
+                            }).catch(() => setSyncing(false));
+                        }, 800);
+                    }
+
+                    return newData;
+                });
+            }, [user, firebaseReady, collectionName, setSyncing]);
+
+            return [data, setDataAndSync];
+        }
 
         // ===== UTILITY FUNCTIONS =====
         const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2);
@@ -207,6 +374,179 @@
             { id: 'settings', label: 'הגדרות', icon: 'settings', color: 'text-gray-400' },
         ];
 
+        // ===== SETUP SCREEN =====
+        function SetupScreen() {
+            const [step, setStep] = useState(1);
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-gray-950 via-gray-900 to-gray-950 flex items-center justify-center p-4">
+                    <div className="max-w-2xl w-full bg-white bg-opacity-5 backdrop-blur-xl rounded-2xl border border-white border-opacity-10 p-6 sm:p-8">
+                        <div className="text-center mb-8">
+                            <div className="w-16 h-16 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                                <i data-lucide="database" className="w-8 h-8 text-white"></i>
+                            </div>
+                            <h1 className="text-2xl sm:text-3xl font-bold text-white mb-2">הגדרת סנכרון</h1>
+                            <p className="text-gray-400">כדי לסנכרן בין מכשירים, צריך להגדיר Firebase (חינם)</p>
+                        </div>
+
+                        <div className="space-y-6 text-right">
+                            {/* Step 1 */}
+                            <div className={`p-4 rounded-xl border transition-all ${step >= 1 ? 'bg-indigo-500 bg-opacity-10 border-indigo-500 border-opacity-30' : 'bg-white bg-opacity-5 border-white border-opacity-10'}`}>
+                                <button onClick={() => setStep(1)} className="w-full text-right">
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${step >= 1 ? 'bg-indigo-500 text-white' : 'bg-gray-700 text-gray-400'}`}>1</div>
+                                        <h3 className="text-white font-semibold">יצירת פרויקט Firebase</h3>
+                                    </div>
+                                </button>
+                                {step === 1 && (
+                                    <div className="mr-11 space-y-2 text-gray-300 text-sm slide-up">
+                                        <p>1. היכנס ל-<a href="https://console.firebase.google.com" target="_blank" className="text-indigo-400 underline">Firebase Console</a></p>
+                                        <p>2. לחץ <strong className="text-white">"Create a project"</strong> (או "הוסף פרויקט")</p>
+                                        <p>3. תן שם לפרויקט (למשל: "my-dashboard")</p>
+                                        <p>4. אפשר לבטל Analytics ולחץ <strong className="text-white">"Create project"</strong></p>
+                                        <button onClick={() => setStep(2)} className="mt-3 px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg text-sm transition">המשך</button>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Step 2 */}
+                            <div className={`p-4 rounded-xl border transition-all ${step >= 2 ? 'bg-indigo-500 bg-opacity-10 border-indigo-500 border-opacity-30' : 'bg-white bg-opacity-5 border-white border-opacity-10'}`}>
+                                <button onClick={() => setStep(2)} className="w-full text-right">
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${step >= 2 ? 'bg-indigo-500 text-white' : 'bg-gray-700 text-gray-400'}`}>2</div>
+                                        <h3 className="text-white font-semibold">הפעלת Authentication</h3>
+                                    </div>
+                                </button>
+                                {step === 2 && (
+                                    <div className="mr-11 space-y-2 text-gray-300 text-sm slide-up">
+                                        <p>1. בתפריט השמאלי לחץ <strong className="text-white">"Authentication"</strong></p>
+                                        <p>2. לחץ <strong className="text-white">"Get started"</strong></p>
+                                        <p>3. בחר <strong className="text-white">"Google"</strong> מהרשימה</p>
+                                        <p>4. הפעל (Enable), בחר מייל תמיכה, ולחץ <strong className="text-white">"Save"</strong></p>
+                                        <button onClick={() => setStep(3)} className="mt-3 px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg text-sm transition">המשך</button>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Step 3 */}
+                            <div className={`p-4 rounded-xl border transition-all ${step >= 3 ? 'bg-indigo-500 bg-opacity-10 border-indigo-500 border-opacity-30' : 'bg-white bg-opacity-5 border-white border-opacity-10'}`}>
+                                <button onClick={() => setStep(3)} className="w-full text-right">
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${step >= 3 ? 'bg-indigo-500 text-white' : 'bg-gray-700 text-gray-400'}`}>3</div>
+                                        <h3 className="text-white font-semibold">יצירת Firestore Database</h3>
+                                    </div>
+                                </button>
+                                {step === 3 && (
+                                    <div className="mr-11 space-y-2 text-gray-300 text-sm slide-up">
+                                        <p>1. בתפריט השמאלי לחץ <strong className="text-white">"Firestore Database"</strong></p>
+                                        <p>2. לחץ <strong className="text-white">"Create database"</strong></p>
+                                        <p>3. בחר מיקום (למשל europe-west1)</p>
+                                        <p>4. בחר <strong className="text-white">"Start in test mode"</strong> ולחץ Create</p>
+                                        <p className="text-yellow-400 text-xs mt-2">* אחרי שזה עובד, נעדכן את חוקי האבטחה</p>
+                                        <button onClick={() => setStep(4)} className="mt-3 px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg text-sm transition">המשך</button>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Step 4 */}
+                            <div className={`p-4 rounded-xl border transition-all ${step >= 4 ? 'bg-indigo-500 bg-opacity-10 border-indigo-500 border-opacity-30' : 'bg-white bg-opacity-5 border-white border-opacity-10'}`}>
+                                <button onClick={() => setStep(4)} className="w-full text-right">
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold ${step >= 4 ? 'bg-indigo-500 text-white' : 'bg-gray-700 text-gray-400'}`}>4</div>
+                                        <h3 className="text-white font-semibold">העתקת הגדרות</h3>
+                                    </div>
+                                </button>
+                                {step === 4 && (
+                                    <div className="mr-11 space-y-2 text-gray-300 text-sm slide-up">
+                                        <p>1. בעמוד הראשי של הפרויקט, לחץ על אייקון <strong className="text-white">{"</>"}</strong> (Web)</p>
+                                        <p>2. תן שם לאפליקציה (למשל "dashboard") ולחץ Register</p>
+                                        <p>3. תראה בלוק קוד עם <code className="text-indigo-300 bg-white bg-opacity-10 px-1 rounded">firebaseConfig</code></p>
+                                        <p>4. העתק את הערכים ושים אותם בקובץ <code className="text-indigo-300 bg-white bg-opacity-10 px-1 rounded">index.html</code> בשורות של <code className="text-indigo-300 bg-white bg-opacity-10 px-1 rounded">FIREBASE_CONFIG</code> (בתחילת הקוד)</p>
+                                        <div className="mt-3 p-3 bg-black bg-opacity-40 rounded-lg text-xs font-mono text-gray-300 overflow-x-auto" dir="ltr">
+                                            <pre>{`const FIREBASE_CONFIG = {
+    apiKey: "AIzaSy...",
+    authDomain: "my-dashboard-xxx.firebaseapp.com",
+    projectId: "my-dashboard-xxx",
+    storageBucket: "my-dashboard-xxx.appspot.com",
+    messagingSenderId: "123456789",
+    appId: "1:123456789:web:abc123"
+};`}</pre>
+                                        </div>
+                                        <p className="mt-3 text-green-400">5. שמור את הקובץ ורענן את הדף!</p>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="mt-8 p-4 bg-yellow-500 bg-opacity-10 border border-yellow-500 border-opacity-30 rounded-xl">
+                            <div className="flex items-start gap-3">
+                                <i data-lucide="info" className="w-5 h-5 text-yellow-400 flex-shrink-0 mt-0.5"></i>
+                                <div className="text-sm text-yellow-200">
+                                    <p className="font-medium mb-1">עד שתגדיר Firebase, הדשבורד עובד רגיל עם שמירה מקומית.</p>
+                                    <p className="text-yellow-300 text-xs">הנתונים נשמרים בדפדפן הזה בלבד, בלי סנכרון בין מכשירים.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // ===== LOGIN SCREEN =====
+        function LoginScreen() {
+            const { signInWithGoogle } = useAuth();
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-gray-950 via-gray-900 to-gray-950 flex items-center justify-center p-4">
+                    <div className="max-w-sm w-full text-center">
+                        <div className="w-20 h-20 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-6">
+                            <i data-lucide="layout-dashboard" className="w-10 h-10 text-white"></i>
+                        </div>
+                        <h1 className="text-3xl font-bold text-white mb-2">לוח בקרה</h1>
+                        <p className="text-gray-400 mb-8">התחבר כדי לסנכרן בין כל המכשירים שלך</p>
+
+                        <button
+                            onClick={signInWithGoogle}
+                            className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white hover:bg-gray-100 text-gray-800 font-medium rounded-xl transition shadow-lg touch-manipulation"
+                        >
+                            <svg className="w-5 h-5" viewBox="0 0 24 24">
+                                <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/>
+                                <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                                <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                                <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                            </svg>
+                            התחבר עם Google
+                        </button>
+
+                        <p className="text-gray-600 text-xs mt-4">הנתונים שלך מאוחסנים בצורה מאובטחת ונגישים רק לך</p>
+                    </div>
+                </div>
+            );
+        }
+
+        // ===== SYNC INDICATOR =====
+        function SyncIndicator() {
+            const { user, syncing, firebaseReady } = useAuth();
+
+            if (!firebaseReady) return null;
+
+            return (
+                <div className="flex items-center gap-1.5">
+                    {syncing ? (
+                        <div className="flex items-center gap-1.5 text-yellow-400">
+                            <i data-lucide="loader-2" className="w-3.5 h-3.5 spin-slow"></i>
+                            <span className="text-xs hidden sm:inline">מסנכרן...</span>
+                        </div>
+                    ) : user ? (
+                        <div className="flex items-center gap-1.5 text-green-400">
+                            <div className="w-2 h-2 rounded-full bg-green-400 pulse-dot"></div>
+                            <span className="text-xs hidden sm:inline">מסונכרן</span>
+                        </div>
+                    ) : null}
+                </div>
+            );
+        }
+
         // ===== TASK ITEM COMPONENT =====
         function TaskItem({ task, onToggle, onEdit, onDelete, onSubtaskToggle }) {
             const [expanded, setExpanded] = useState(false);
@@ -227,7 +567,6 @@
                 } hover:bg-opacity-10`}>
                     <div className="p-3 sm:p-4">
                         <div className="flex items-start gap-3">
-                            {/* Checkbox */}
                             <button
                                 onClick={() => onToggle(task.id)}
                                 className={`task-checkbox flex-shrink-0 w-6 h-6 mt-0.5 rounded-lg border-2 flex items-center justify-center transition-all touch-manipulation ${
@@ -239,7 +578,6 @@
                                 {task.completed && <i data-lucide="check" className="w-4 h-4"></i>}
                             </button>
 
-                            {/* Content */}
                             <div className="flex-1 min-w-0">
                                 <div className="flex items-start justify-between gap-2">
                                     <h3 className={`font-medium text-sm sm:text-base ${
@@ -267,21 +605,17 @@
                                     <p className="text-gray-400 text-xs sm:text-sm mt-1 line-clamp-2">{task.description}</p>
                                 )}
 
-                                {/* Tags Row */}
                                 <div className="flex flex-wrap items-center gap-2 mt-2">
-                                    {/* Priority Badge */}
                                     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${priority.color} bg-opacity-20 ${priority.textColor}`}>
                                         <span className={`w-1.5 h-1.5 rounded-full ${priority.color}`}></span>
                                         {priority.label}
                                     </span>
 
-                                    {/* Category Badge */}
                                     <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-white bg-opacity-10 ${category.color}`}>
                                         <i data-lucide={category.icon} className="w-3 h-3"></i>
                                         {category.label}
                                     </span>
 
-                                    {/* Due Date */}
                                     {task.dueDate && (
                                         <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${
                                             overdue
@@ -295,7 +629,6 @@
                                         </span>
                                     )}
 
-                                    {/* Subtasks count */}
                                     {subtasksTotal > 0 && (
                                         <button
                                             onClick={() => setExpanded(!expanded)}
@@ -308,10 +641,9 @@
                                     )}
                                 </div>
 
-                                {/* Subtasks List */}
                                 {expanded && task.subtasks && task.subtasks.length > 0 && (
                                     <div className="mt-3 space-y-1.5 slide-up">
-                                        {task.subtasks.map((subtask, idx) => (
+                                        {task.subtasks.map((subtask) => (
                                             <div key={subtask.id} className="flex items-center gap-2 pr-2">
                                                 <button
                                                     onClick={() => onSubtaskToggle(task.id, subtask.id)}
@@ -355,7 +687,6 @@
             const handleSubmit = (e) => {
                 e.preventDefault();
                 if (!title.trim()) return;
-
                 onSave({
                     id: task?.id || generateId(),
                     title: title.trim(),
@@ -382,102 +713,45 @@
             return (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4 fade-in" onClick={onClose}>
                     <div className="absolute inset-0 bg-black bg-opacity-60 backdrop-blur-sm"></div>
-                    <div
-                        className="relative bg-gray-900 border border-white border-opacity-20 rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto slide-up"
-                        onClick={e => e.stopPropagation()}
-                    >
+                    <div className="relative bg-gray-900 border border-white border-opacity-20 rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto slide-up" onClick={e => e.stopPropagation()}>
                         <div className="sticky top-0 bg-gray-900 border-b border-white border-opacity-10 p-4 flex justify-between items-center rounded-t-2xl z-10">
-                            <h2 className="text-lg font-bold text-white">
-                                {task ? 'עריכת משימה' : 'משימה חדשה'}
-                            </h2>
+                            <h2 className="text-lg font-bold text-white">{task ? 'עריכת משימה' : 'משימה חדשה'}</h2>
                             <button onClick={onClose} className="p-2 rounded-lg hover:bg-white hover:bg-opacity-10 text-gray-400 transition touch-manipulation">
                                 <i data-lucide="x" className="w-5 h-5"></i>
                             </button>
                         </div>
-
                         <form onSubmit={handleSubmit} className="p-4 space-y-4">
-                            {/* Title */}
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-1.5">כותרת</label>
-                                <input
-                                    ref={titleRef}
-                                    type="text"
-                                    value={title}
-                                    onChange={e => setTitle(e.target.value)}
-                                    placeholder="מה צריך לעשות?"
-                                    required
-                                    className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition text-sm sm:text-base"
-                                />
+                                <input ref={titleRef} type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder="מה צריך לעשות?" required className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition text-sm sm:text-base" />
                             </div>
-
-                            {/* Description */}
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-1.5">תיאור (אופציונלי)</label>
-                                <textarea
-                                    value={description}
-                                    onChange={e => setDescription(e.target.value)}
-                                    placeholder="פרטים נוספים..."
-                                    rows="2"
-                                    className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition resize-none text-sm sm:text-base"
-                                />
+                                <textarea value={description} onChange={e => setDescription(e.target.value)} placeholder="פרטים נוספים..." rows="2" className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition resize-none text-sm sm:text-base" />
                             </div>
-
-                            {/* Priority & Category */}
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-1.5">עדיפות</label>
-                                    <select
-                                        value={priority}
-                                        onChange={e => setPriority(e.target.value)}
-                                        className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white outline-none focus:border-indigo-500 transition text-sm sm:text-base"
-                                    >
-                                        {PRIORITIES.map(p => (
-                                            <option key={p.value} value={p.value} className="bg-gray-800">{p.label}</option>
-                                        ))}
+                                    <select value={priority} onChange={e => setPriority(e.target.value)} className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white outline-none focus:border-indigo-500 transition text-sm sm:text-base">
+                                        {PRIORITIES.map(p => (<option key={p.value} value={p.value} className="bg-gray-800">{p.label}</option>))}
                                     </select>
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-1.5">קטגוריה</label>
-                                    <select
-                                        value={category}
-                                        onChange={e => setCategory(e.target.value)}
-                                        className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white outline-none focus:border-indigo-500 transition text-sm sm:text-base"
-                                    >
-                                        {CATEGORIES.map(c => (
-                                            <option key={c.value} value={c.value} className="bg-gray-800">{c.label}</option>
-                                        ))}
+                                    <select value={category} onChange={e => setCategory(e.target.value)} className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white outline-none focus:border-indigo-500 transition text-sm sm:text-base">
+                                        {CATEGORIES.map(c => (<option key={c.value} value={c.value} className="bg-gray-800">{c.label}</option>))}
                                     </select>
                                 </div>
                             </div>
-
-                            {/* Due Date */}
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-1.5">תאריך יעד</label>
-                                <input
-                                    type="date"
-                                    value={dueDate}
-                                    onChange={e => setDueDate(e.target.value)}
-                                    className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white outline-none focus:border-indigo-500 transition text-sm sm:text-base"
-                                />
+                                <input type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} className="w-full px-4 py-3 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white outline-none focus:border-indigo-500 transition text-sm sm:text-base" />
                             </div>
-
-                            {/* Subtasks */}
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-1.5">תתי-משימות</label>
                                 <div className="flex gap-2 mb-2">
-                                    <input
-                                        type="text"
-                                        value={newSubtask}
-                                        onChange={e => setNewSubtask(e.target.value)}
-                                        onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), addSubtask())}
-                                        placeholder="הוסף תת-משימה..."
-                                        className="flex-1 px-4 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition text-sm"
-                                    />
-                                    <button
-                                        type="button"
-                                        onClick={addSubtask}
-                                        className="px-3 py-2.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl transition touch-manipulation"
-                                    >
+                                    <input type="text" value={newSubtask} onChange={e => setNewSubtask(e.target.value)} onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), addSubtask())} placeholder="הוסף תת-משימה..." className="flex-1 px-4 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-xl text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition text-sm" />
+                                    <button type="button" onClick={addSubtask} className="px-3 py-2.5 bg-indigo-500 hover:bg-indigo-600 text-white rounded-xl transition touch-manipulation">
                                         <i data-lucide="plus" className="w-4 h-4"></i>
                                     </button>
                                 </div>
@@ -486,11 +760,7 @@
                                         {subtasks.map(st => (
                                             <div key={st.id} className="flex items-center justify-between gap-2 px-3 py-2 bg-white bg-opacity-5 rounded-lg">
                                                 <span className="text-sm text-gray-300">{st.title}</span>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => removeSubtask(st.id)}
-                                                    className="p-1 text-gray-500 hover:text-red-400 transition touch-manipulation"
-                                                >
+                                                <button type="button" onClick={() => removeSubtask(st.id)} className="p-1 text-gray-500 hover:text-red-400 transition touch-manipulation">
                                                     <i data-lucide="x" className="w-3.5 h-3.5"></i>
                                                 </button>
                                             </div>
@@ -498,22 +768,11 @@
                                     </div>
                                 )}
                             </div>
-
-                            {/* Actions */}
                             <div className="flex gap-3 pt-2">
-                                <button
-                                    type="submit"
-                                    className="flex-1 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white font-medium rounded-xl transition touch-manipulation"
-                                >
+                                <button type="submit" className="flex-1 py-3 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white font-medium rounded-xl transition touch-manipulation">
                                     {task ? 'שמור שינויים' : 'הוסף משימה'}
                                 </button>
-                                <button
-                                    type="button"
-                                    onClick={onClose}
-                                    className="px-6 py-3 bg-white bg-opacity-10 hover:bg-opacity-20 text-white rounded-xl transition touch-manipulation"
-                                >
-                                    ביטול
-                                </button>
+                                <button type="button" onClick={onClose} className="px-6 py-3 bg-white bg-opacity-10 hover:bg-opacity-20 text-white rounded-xl transition touch-manipulation">ביטול</button>
                             </div>
                         </form>
                     </div>
@@ -523,58 +782,51 @@
 
         // ===== TASKS PANEL =====
         function TasksPanel() {
-            const [tasks, setTasks] = useState(() => {
-                const saved = localStorage.getItem('dashboard_tasks');
-                return saved ? JSON.parse(saved) : [
-                    {
-                        id: generateId(),
-                        title: 'לבנות דשבורד ניהול',
-                        description: 'בניית לוח בקרה כללי עם ניהול משימות, בוטים וניתוח',
-                        priority: 'high',
-                        category: 'work',
-                        dueDate: '',
-                        subtasks: [
-                            { id: generateId(), title: 'חלון משימות', completed: true },
-                            { id: generateId(), title: 'חלון הרגלים', completed: false },
-                            { id: generateId(), title: 'חלון בוטים', completed: false },
-                            { id: generateId(), title: 'חלון ניתוח', completed: false },
-                        ],
-                        completed: false,
-                        createdAt: new Date().toISOString(),
-                    },
-                ];
-            });
+            const defaultTasks = [
+                {
+                    id: generateId(),
+                    title: 'לבנות דשבורד ניהול',
+                    description: 'בניית לוח בקרה כללי עם ניהול משימות, בוטים וניתוח',
+                    priority: 'high',
+                    category: 'work',
+                    dueDate: '',
+                    subtasks: [
+                        { id: generateId(), title: 'חלון משימות', completed: true },
+                        { id: generateId(), title: 'חלון הרגלים', completed: false },
+                        { id: generateId(), title: 'חלון בוטים', completed: false },
+                        { id: generateId(), title: 'חלון ניתוח', completed: false },
+                    ],
+                    completed: false,
+                    createdAt: new Date().toISOString(),
+                },
+            ];
+
+            const [tasks, setTasks] = useFirestoreSync('tasks', 'dashboard_tasks', defaultTasks);
 
             const [showModal, setShowModal] = useState(false);
             const [editingTask, setEditingTask] = useState(null);
-            const [filter, setFilter] = useState('all'); // all, active, completed
-            const [sortBy, setSortBy] = useState('priority'); // priority, date, created
+            const [filter, setFilter] = useState('all');
+            const [sortBy, setSortBy] = useState('priority');
             const [searchQuery, setSearchQuery] = useState('');
             const [categoryFilter, setCategoryFilter] = useState('all');
 
-            useEffect(() => {
-                localStorage.setItem('dashboard_tasks', JSON.stringify(tasks));
-            }, [tasks]);
-
             const toggleTask = (id) => {
-                setTasks(tasks.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
+                setTasks(prev => prev.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
             };
 
             const toggleSubtask = (taskId, subtaskId) => {
-                setTasks(tasks.map(t => {
+                setTasks(prev => prev.map(t => {
                     if (t.id !== taskId) return t;
-                    const newSubtasks = t.subtasks.map(s =>
-                        s.id === subtaskId ? { ...s, completed: !s.completed } : s
-                    );
+                    const newSubtasks = t.subtasks.map(s => s.id === subtaskId ? { ...s, completed: !s.completed } : s);
                     return { ...t, subtasks: newSubtasks };
                 }));
             };
 
             const saveTask = (taskData) => {
                 if (editingTask) {
-                    setTasks(tasks.map(t => t.id === taskData.id ? taskData : t));
+                    setTasks(prev => prev.map(t => t.id === taskData.id ? taskData : t));
                 } else {
-                    setTasks([taskData, ...tasks]);
+                    setTasks(prev => [taskData, ...prev]);
                 }
                 setShowModal(false);
                 setEditingTask(null);
@@ -582,7 +834,7 @@
 
             const deleteTask = (id) => {
                 if (confirm('למחוק את המשימה?')) {
-                    setTasks(tasks.filter(t => t.id !== id));
+                    setTasks(prev => prev.filter(t => t.id !== id));
                 }
             };
 
@@ -591,29 +843,17 @@
                 setShowModal(true);
             };
 
-            // Filter & Sort
             const priorityOrder = { urgent: 0, high: 1, medium: 2, low: 3 };
 
             const filteredTasks = useMemo(() => {
                 let result = [...tasks];
-
-                // Status filter
                 if (filter === 'active') result = result.filter(t => !t.completed);
                 if (filter === 'completed') result = result.filter(t => t.completed);
-
-                // Category filter
                 if (categoryFilter !== 'all') result = result.filter(t => t.category === categoryFilter);
-
-                // Search
                 if (searchQuery) {
                     const q = searchQuery.toLowerCase();
-                    result = result.filter(t =>
-                        t.title.toLowerCase().includes(q) ||
-                        (t.description && t.description.toLowerCase().includes(q))
-                    );
+                    result = result.filter(t => t.title.toLowerCase().includes(q) || (t.description && t.description.toLowerCase().includes(q)));
                 }
-
-                // Sort
                 result.sort((a, b) => {
                     if (a.completed !== b.completed) return a.completed ? 1 : -1;
                     if (sortBy === 'priority') return priorityOrder[a.priority] - priorityOrder[b.priority];
@@ -624,108 +864,57 @@
                     }
                     return new Date(b.createdAt) - new Date(a.createdAt);
                 });
-
                 return result;
             }, [tasks, filter, sortBy, searchQuery, categoryFilter]);
 
-            // Stats
             const totalTasks = tasks.length;
             const completedTasks = tasks.filter(t => t.completed).length;
             const overdueTasks = tasks.filter(t => !t.completed && isOverdue(t.dueDate)).length;
-            const todayTasks = tasks.filter(t => {
-                if (!t.dueDate || t.completed) return false;
-                return getDaysUntil(t.dueDate) === 0;
-            }).length;
+            const todayTasks = tasks.filter(t => { if (!t.dueDate || t.completed) return false; return getDaysUntil(t.dueDate) === 0; }).length;
 
             return (
                 <div className="space-y-4 sm:space-y-6 fade-in">
-                    {/* Stats Row */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="list-todo" className="w-4 h-4 text-blue-400"></i>
-                                <span className="text-gray-400 text-xs">סה״כ</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="list-todo" className="w-4 h-4 text-blue-400"></i><span className="text-gray-400 text-xs">סה״כ</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{totalTasks}</div>
                         </div>
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="check-circle" className="w-4 h-4 text-green-400"></i>
-                                <span className="text-gray-400 text-xs">הושלמו</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="check-circle" className="w-4 h-4 text-green-400"></i><span className="text-gray-400 text-xs">הושלמו</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{completedTasks}</div>
                         </div>
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="clock" className="w-4 h-4 text-orange-400"></i>
-                                <span className="text-gray-400 text-xs">להיום</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="clock" className="w-4 h-4 text-orange-400"></i><span className="text-gray-400 text-xs">להיום</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{todayTasks}</div>
                         </div>
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="alert-triangle" className="w-4 h-4 text-red-400"></i>
-                                <span className="text-gray-400 text-xs">באיחור</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="alert-triangle" className="w-4 h-4 text-red-400"></i><span className="text-gray-400 text-xs">באיחור</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{overdueTasks}</div>
                         </div>
                     </div>
 
-                    {/* Toolbar */}
                     <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
                         <div className="flex flex-col sm:flex-row gap-3">
-                            {/* Search */}
                             <div className="relative flex-1">
                                 <i data-lucide="search" className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500"></i>
-                                <input
-                                    type="text"
-                                    value={searchQuery}
-                                    onChange={e => setSearchQuery(e.target.value)}
-                                    placeholder="חיפוש משימות..."
-                                    className="w-full pr-10 pl-4 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition text-sm"
-                                />
+                                <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="חיפוש משימות..." className="w-full pr-10 pl-4 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white placeholder-gray-500 outline-none focus:border-indigo-500 transition text-sm" />
                             </div>
-
                             <div className="flex gap-2 flex-wrap">
-                                {/* Status Filter */}
-                                <select
-                                    value={filter}
-                                    onChange={e => setFilter(e.target.value)}
-                                    className="px-3 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white text-sm outline-none"
-                                >
+                                <select value={filter} onChange={e => setFilter(e.target.value)} className="px-3 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white text-sm outline-none">
                                     <option value="all" className="bg-gray-800">הכל</option>
                                     <option value="active" className="bg-gray-800">פעילות</option>
                                     <option value="completed" className="bg-gray-800">הושלמו</option>
                                 </select>
-
-                                {/* Category Filter */}
-                                <select
-                                    value={categoryFilter}
-                                    onChange={e => setCategoryFilter(e.target.value)}
-                                    className="px-3 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white text-sm outline-none"
-                                >
+                                <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)} className="px-3 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white text-sm outline-none">
                                     <option value="all" className="bg-gray-800">כל הקטגוריות</option>
-                                    {CATEGORIES.map(c => (
-                                        <option key={c.value} value={c.value} className="bg-gray-800">{c.label}</option>
-                                    ))}
+                                    {CATEGORIES.map(c => (<option key={c.value} value={c.value} className="bg-gray-800">{c.label}</option>))}
                                 </select>
-
-                                {/* Sort */}
-                                <select
-                                    value={sortBy}
-                                    onChange={e => setSortBy(e.target.value)}
-                                    className="px-3 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white text-sm outline-none"
-                                >
+                                <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="px-3 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white text-sm outline-none">
                                     <option value="priority" className="bg-gray-800">לפי עדיפות</option>
                                     <option value="date" className="bg-gray-800">לפי תאריך</option>
                                     <option value="created" className="bg-gray-800">לפי יצירה</option>
                                 </select>
-
-                                {/* Add Button */}
-                                <button
-                                    onClick={() => { setEditingTask(null); setShowModal(true); }}
-                                    className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white rounded-lg transition text-sm font-medium touch-manipulation"
-                                >
+                                <button onClick={() => { setEditingTask(null); setShowModal(true); }} className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white rounded-lg transition text-sm font-medium touch-manipulation">
                                     <i data-lucide="plus" className="w-4 h-4"></i>
                                     <span className="hidden sm:inline">משימה חדשה</span>
                                 </button>
@@ -733,86 +922,55 @@
                         </div>
                     </div>
 
-                    {/* Task List */}
                     <div className="space-y-2 sm:space-y-3">
                         {filteredTasks.length === 0 ? (
                             <div className="text-center py-16">
                                 <i data-lucide="inbox" className="w-16 h-16 text-gray-600 mx-auto mb-4"></i>
-                                <p className="text-gray-400 text-lg mb-2">
-                                    {searchQuery ? 'לא נמצאו תוצאות' : filter === 'completed' ? 'אין משימות שהושלמו' : 'אין משימות עדיין'}
-                                </p>
+                                <p className="text-gray-400 text-lg mb-2">{searchQuery ? 'לא נמצאו תוצאות' : filter === 'completed' ? 'אין משימות שהושלמו' : 'אין משימות עדיין'}</p>
                                 {!searchQuery && filter === 'all' && (
-                                    <button
-                                        onClick={() => { setEditingTask(null); setShowModal(true); }}
-                                        className="text-indigo-400 hover:text-indigo-300 text-sm transition touch-manipulation"
-                                    >
-                                        הוסף את המשימה הראשונה שלך
-                                    </button>
+                                    <button onClick={() => { setEditingTask(null); setShowModal(true); }} className="text-indigo-400 hover:text-indigo-300 text-sm transition touch-manipulation">הוסף את המשימה הראשונה שלך</button>
                                 )}
                             </div>
                         ) : (
                             filteredTasks.map(task => (
-                                <TaskItem
-                                    key={task.id}
-                                    task={task}
-                                    onToggle={toggleTask}
-                                    onEdit={editTask}
-                                    onDelete={deleteTask}
-                                    onSubtaskToggle={toggleSubtask}
-                                />
+                                <TaskItem key={task.id} task={task} onToggle={toggleTask} onEdit={editTask} onDelete={deleteTask} onSubtaskToggle={toggleSubtask} />
                             ))
                         )}
                     </div>
 
-                    {/* Progress Bar */}
                     {totalTasks > 0 && (
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-4 border border-white border-opacity-10">
                             <div className="flex justify-between items-center mb-2">
                                 <span className="text-gray-300 text-sm">התקדמות כללית</span>
-                                <span className="text-white font-bold">
-                                    {totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0}%
-                                </span>
+                                <span className="text-white font-bold">{totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0}%</span>
                             </div>
                             <div className="w-full bg-white bg-opacity-10 rounded-full h-2.5">
-                                <div
-                                    className="bg-gradient-to-r from-indigo-500 to-purple-500 h-2.5 rounded-full transition-all duration-500"
-                                    style={{ width: `${totalTasks > 0 ? (completedTasks / totalTasks) * 100 : 0}%` }}
-                                />
+                                <div className="bg-gradient-to-r from-indigo-500 to-purple-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${totalTasks > 0 ? (completedTasks / totalTasks) * 100 : 0}%` }} />
                             </div>
                         </div>
                     )}
 
-                    {/* Modal */}
                     {showModal && (
-                        <TaskModal
-                            task={editingTask}
-                            onSave={saveTask}
-                            onClose={() => { setShowModal(false); setEditingTask(null); }}
-                        />
+                        <TaskModal task={editingTask} onSave={saveTask} onClose={() => { setShowModal(false); setEditingTask(null); }} />
                     )}
                 </div>
             );
         }
 
-        // ===== HABITS PANEL (from existing code) =====
+        // ===== HABITS PANEL =====
         function HabitsPanel() {
             const today = new Date().toISOString().split('T')[0];
 
-            const [habits, setHabits] = useState(() => {
-                const saved = localStorage.getItem('habits');
-                return saved ? JSON.parse(saved) : [
-                    { id: 1, name: 'התעוררות מוקדמת (6:00)', xp: 20, color: 'bg-orange-500', category: 'בריאות' },
-                    { id: 2, name: 'אימון גופני 30 דק׳', xp: 30, color: 'bg-red-500', category: 'בריאות' },
-                    { id: 3, name: 'קריאה 20 דק׳', xp: 20, color: 'bg-blue-500', category: 'פרודוקטיביות' },
-                    { id: 4, name: 'מדיטציה 10 דק׳', xp: 15, color: 'bg-purple-500', category: 'בריאות' },
-                    { id: 5, name: 'תכנון יומי', xp: 15, color: 'bg-green-500', category: 'פרודוקטיביות' },
-                ];
-            });
+            const defaultHabits = [
+                { id: 1, name: 'התעוררות מוקדמת (6:00)', xp: 20, color: 'bg-orange-500', category: 'בריאות' },
+                { id: 2, name: 'אימון גופני 30 דק׳', xp: 30, color: 'bg-red-500', category: 'בריאות' },
+                { id: 3, name: 'קריאה 20 דק׳', xp: 20, color: 'bg-blue-500', category: 'פרודוקטיביות' },
+                { id: 4, name: 'מדיטציה 10 דק׳', xp: 15, color: 'bg-purple-500', category: 'בריאות' },
+                { id: 5, name: 'תכנון יומי', xp: 15, color: 'bg-green-500', category: 'פרודוקטיביות' },
+            ];
 
-            const [completedHabits, setCompletedHabits] = useState(() => {
-                const saved = localStorage.getItem('habitData');
-                return saved ? JSON.parse(saved) : {};
-            });
+            const [habits, setHabits] = useFirestoreSync('habits', 'habits', defaultHabits);
+            const [completedHabits, setCompletedHabits] = useFirestoreSync('habitData', 'habitData', {});
 
             const [editMode, setEditMode] = useState(false);
             const [editingHabit, setEditingHabit] = useState(null);
@@ -820,29 +978,22 @@
             const [celebrationMessage, setCelebrationMessage] = useState('');
             const [showAddForm, setShowAddForm] = useState(false);
 
-            useEffect(() => {
-                localStorage.setItem('habitData', JSON.stringify(completedHabits));
-            }, [completedHabits]);
-
-            useEffect(() => {
-                localStorage.setItem('habits', JSON.stringify(habits));
-            }, [habits]);
-
             const toggleHabit = (habitId) => {
-                const newCompleted = { ...completedHabits };
-                if (!newCompleted[today]) newCompleted[today] = [];
-
-                if (newCompleted[today].includes(habitId)) {
-                    newCompleted[today] = newCompleted[today].filter(id => id !== habitId);
-                } else {
-                    newCompleted[today] = [...newCompleted[today], habitId];
-                    if (newCompleted[today].length === habits.length) {
-                        setCelebrationMessage('יום מושלם! כל ההרגלים הושלמו!');
-                        setShowCelebration(true);
-                        setTimeout(() => setShowCelebration(false), 3000);
+                setCompletedHabits(prev => {
+                    const newCompleted = { ...prev };
+                    if (!newCompleted[today]) newCompleted[today] = [];
+                    if (newCompleted[today].includes(habitId)) {
+                        newCompleted[today] = newCompleted[today].filter(id => id !== habitId);
+                    } else {
+                        newCompleted[today] = [...newCompleted[today], habitId];
+                        if (newCompleted[today].length === habits.length) {
+                            setCelebrationMessage('יום מושלם! כל ההרגלים הושלמו!');
+                            setShowCelebration(true);
+                            setTimeout(() => setShowCelebration(false), 3000);
+                        }
                     }
-                }
-                setCompletedHabits(newCompleted);
+                    return newCompleted;
+                });
             };
 
             const getDailyXP = (date) => {
@@ -868,9 +1019,7 @@
                         currentDate.setDate(currentDate.getDate() - 1);
                     } else if (dateStr === today && completed.length > 0) {
                         currentDate.setDate(currentDate.getDate() - 1);
-                    } else {
-                        break;
-                    }
+                    } else { break; }
                 }
                 return streak;
             };
@@ -894,44 +1043,38 @@
             const weeklyXP = getWeeklyXP();
 
             const addHabit = (habitData) => {
-                const newHabit = {
+                setHabits(prev => [...prev, {
                     id: Date.now(),
                     name: habitData.name || 'הרגל חדש',
                     xp: habitData.xp || 10,
                     color: habitData.color || 'bg-gray-500',
                     category: habitData.category || 'כללי'
-                };
-                setHabits([...habits, newHabit]);
+                }]);
                 setShowAddForm(false);
             };
 
             const updateHabit = (id, field, value) => {
-                setHabits(habits.map(h => h.id === id ? { ...h, [field]: value } : h));
+                setHabits(prev => prev.map(h => h.id === id ? { ...h, [field]: value } : h));
             };
 
             const deleteHabit = (id) => {
                 if (confirm('האם אתה בטוח שברצונך למחוק את ההרגל?')) {
-                    setHabits(habits.filter(h => h.id !== id));
+                    setHabits(prev => prev.filter(h => h.id !== id));
                     setEditingHabit(null);
                 }
             };
 
             const habitColors = [
-                { value: 'bg-red-500', label: 'אדום' },
-                { value: 'bg-orange-500', label: 'כתום' },
-                { value: 'bg-yellow-500', label: 'צהוב' },
-                { value: 'bg-green-500', label: 'ירוק' },
-                { value: 'bg-blue-500', label: 'כחול' },
-                { value: 'bg-indigo-500', label: 'אינדיגו' },
-                { value: 'bg-purple-500', label: 'סגול' },
-                { value: 'bg-pink-500', label: 'ורוד' }
+                { value: 'bg-red-500', label: 'אדום' }, { value: 'bg-orange-500', label: 'כתום' },
+                { value: 'bg-yellow-500', label: 'צהוב' }, { value: 'bg-green-500', label: 'ירוק' },
+                { value: 'bg-blue-500', label: 'כחול' }, { value: 'bg-indigo-500', label: 'אינדיגו' },
+                { value: 'bg-purple-500', label: 'סגול' }, { value: 'bg-pink-500', label: 'ורוד' }
             ];
 
             const todayCompleted = completedHabits[today] || [];
 
             return (
                 <div className="space-y-4 sm:space-y-6 fade-in">
-                    {/* Celebration */}
                     {showCelebration && (
                         <div className="fixed inset-0 flex items-center justify-center z-50 pointer-events-none px-4">
                             <div className="bg-white rounded-2xl shadow-2xl p-6 sm:p-8 text-center celebration-animation max-w-sm w-full">
@@ -941,67 +1084,40 @@
                         </div>
                     )}
 
-                    {/* Stats */}
                     <div className="grid grid-cols-3 gap-3">
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="target" className="w-4 h-4 text-blue-400"></i>
-                                <span className="text-gray-400 text-xs">היום</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="target" className="w-4 h-4 text-blue-400"></i><span className="text-gray-400 text-xs">היום</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{todayXP}<span className="text-sm text-gray-400">/{maxDailyXP}</span></div>
                             <div className="mt-2 bg-white bg-opacity-10 rounded-full h-1.5">
                                 <div className="bg-gradient-to-r from-blue-400 to-cyan-400 h-1.5 rounded-full transition-all duration-500" style={{ width: `${todayProgress}%` }} />
                             </div>
                         </div>
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="flame" className="w-4 h-4 text-orange-400"></i>
-                                <span className="text-gray-400 text-xs">סטריק</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="flame" className="w-4 h-4 text-orange-400"></i><span className="text-gray-400 text-xs">סטריק</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{streak}</div>
                             <div className="text-orange-300 text-xs mt-1">ימים רצופים</div>
                         </div>
                         <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-3 sm:p-4 border border-white border-opacity-10">
-                            <div className="flex items-center gap-2 mb-1">
-                                <i data-lucide="calendar" className="w-4 h-4 text-green-400"></i>
-                                <span className="text-gray-400 text-xs">שבועי</span>
-                            </div>
+                            <div className="flex items-center gap-2 mb-1"><i data-lucide="calendar" className="w-4 h-4 text-green-400"></i><span className="text-gray-400 text-xs">שבועי</span></div>
                             <div className="text-xl sm:text-2xl font-bold text-white">{weeklyXP}</div>
                             <div className="text-green-300 text-xs mt-1">XP</div>
                         </div>
                     </div>
 
-                    {/* Habits List */}
                     <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-4 sm:p-6 border border-white border-opacity-10">
                         <div className="flex justify-between items-center mb-4">
                             <h2 className="text-lg sm:text-xl font-bold text-white">הרגלים יומיים</h2>
                             <div className="flex gap-2">
-                                {editMode && (
-                                    <button
-                                        onClick={() => setShowAddForm(true)}
-                                        className="p-2 bg-green-500 hover:bg-green-600 text-white rounded-lg transition touch-manipulation"
-                                    >
-                                        <i data-lucide="plus" className="w-4 h-4"></i>
-                                    </button>
-                                )}
-                                <button
-                                    onClick={() => setEditMode(!editMode)}
-                                    className={`p-2 rounded-lg transition touch-manipulation ${editMode ? 'bg-red-500 hover:bg-red-600' : 'bg-white bg-opacity-10 hover:bg-opacity-20'} text-white`}
-                                >
+                                {editMode && (<button onClick={() => setShowAddForm(true)} className="p-2 bg-green-500 hover:bg-green-600 text-white rounded-lg transition touch-manipulation"><i data-lucide="plus" className="w-4 h-4"></i></button>)}
+                                <button onClick={() => setEditMode(!editMode)} className={`p-2 rounded-lg transition touch-manipulation ${editMode ? 'bg-red-500 hover:bg-red-600' : 'bg-white bg-opacity-10 hover:bg-opacity-20'} text-white`}>
                                     <i data-lucide={editMode ? 'x' : 'settings'} className="w-4 h-4"></i>
                                 </button>
                             </div>
                         </div>
 
-                        {/* Add Form */}
                         {showAddForm && (
                             <div className="mb-4 p-4 bg-white bg-opacity-5 rounded-xl border border-white border-opacity-10 slide-up">
-                                <form onSubmit={(e) => {
-                                    e.preventDefault();
-                                    const formData = new FormData(e.target);
-                                    addHabit({ name: formData.get('name'), xp: parseInt(formData.get('xp')), color: formData.get('color') });
-                                    e.target.reset();
-                                }}>
+                                <form onSubmit={(e) => { e.preventDefault(); const fd = new FormData(e.target); addHabit({ name: fd.get('name'), xp: parseInt(fd.get('xp')), color: fd.get('color') }); e.target.reset(); }}>
                                     <div className="space-y-3">
                                         <input type="text" name="name" required placeholder="שם ההרגל" className="w-full px-4 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white placeholder-gray-500 outline-none text-sm" />
                                         <div className="grid grid-cols-2 gap-3">
@@ -1023,13 +1139,8 @@
                             {habits.map(habit => {
                                 const isCompleted = todayCompleted.includes(habit.id);
                                 const isEditing = editingHabit === habit.id;
-
                                 return (
-                                    <div key={habit.id} className={`p-3 rounded-xl border-2 transition-all ${
-                                        isCompleted
-                                            ? 'bg-green-500 bg-opacity-10 border-green-500 border-opacity-50'
-                                            : 'bg-white bg-opacity-5 border-white border-opacity-10 hover:bg-opacity-10'
-                                    }`}>
+                                    <div key={habit.id} className={`p-3 rounded-xl border-2 transition-all ${isCompleted ? 'bg-green-500 bg-opacity-10 border-green-500 border-opacity-50' : 'bg-white bg-opacity-5 border-white border-opacity-10 hover:bg-opacity-10'}`}>
                                         {isEditing ? (
                                             <div className="space-y-3">
                                                 <input type="text" value={habit.name} onChange={e => updateHabit(habit.id, 'name', e.target.value)} className="w-full px-4 py-2.5 bg-white bg-opacity-10 border border-white border-opacity-20 rounded-lg text-white outline-none text-sm" />
@@ -1046,29 +1157,14 @@
                                             </div>
                                         ) : (
                                             <div className="flex items-center gap-3">
-                                                <button
-                                                    onClick={() => !editMode && toggleHabit(habit.id)}
-                                                    disabled={editMode}
-                                                    className={`flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all touch-manipulation ${
-                                                        isCompleted
-                                                            ? `${habit.color} text-white scale-110`
-                                                            : 'bg-white bg-opacity-10 text-gray-400 hover:bg-opacity-20'
-                                                    }`}
-                                                >
+                                                <button onClick={() => !editMode && toggleHabit(habit.id)} disabled={editMode} className={`flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all touch-manipulation ${isCompleted ? `${habit.color} text-white scale-110` : 'bg-white bg-opacity-10 text-gray-400 hover:bg-opacity-20'}`}>
                                                     {isCompleted && <i data-lucide="check" className="w-5 h-5"></i>}
                                                 </button>
                                                 <div className="flex-1 min-w-0">
                                                     <div className={`font-medium text-sm ${isCompleted ? 'text-green-300' : 'text-white'}`}>{habit.name}</div>
-                                                    <div className="flex items-center gap-1.5 text-xs text-gray-400 mt-0.5">
-                                                        <i data-lucide="star" className="w-3 h-3 text-yellow-400"></i>
-                                                        {habit.xp} XP
-                                                    </div>
+                                                    <div className="flex items-center gap-1.5 text-xs text-gray-400 mt-0.5"><i data-lucide="star" className="w-3 h-3 text-yellow-400"></i>{habit.xp} XP</div>
                                                 </div>
-                                                {editMode && (
-                                                    <button onClick={() => setEditingHabit(habit.id)} className="p-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition touch-manipulation">
-                                                        <i data-lucide="edit-2" className="w-3.5 h-3.5"></i>
-                                                    </button>
-                                                )}
+                                                {editMode && (<button onClick={() => setEditingHabit(habit.id)} className="p-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition touch-manipulation"><i data-lucide="edit-2" className="w-3.5 h-3.5"></i></button>)}
                                             </div>
                                         )}
                                     </div>
@@ -1089,7 +1185,7 @@
             );
         }
 
-        // ===== BOTS PANEL (placeholder) =====
+        // ===== BOTS PANEL =====
         function BotsPanel() {
             return (
                 <div className="fade-in">
@@ -1108,7 +1204,7 @@
             );
         }
 
-        // ===== ANALYTICS PANEL (placeholder) =====
+        // ===== ANALYTICS PANEL =====
         function AnalyticsPanel() {
             return (
                 <div className="fade-in">
@@ -1127,20 +1223,54 @@
             );
         }
 
-        // ===== SETTINGS PANEL (placeholder) =====
+        // ===== SETTINGS PANEL =====
         function SettingsPanel() {
+            const { user, signOut, firebaseReady } = useAuth();
+            const [showSetup, setShowSetup] = useState(false);
+
+            if (showSetup) return <SetupScreen />;
+
             return (
-                <div className="fade-in">
-                    <div className="text-center py-20">
-                        <div className="w-20 h-20 bg-gray-500 bg-opacity-20 rounded-2xl flex items-center justify-center mx-auto mb-6">
-                            <i data-lucide="settings" className="w-10 h-10 text-gray-400"></i>
-                        </div>
-                        <h2 className="text-2xl font-bold text-white mb-3">הגדרות</h2>
-                        <p className="text-gray-400 max-w-md mx-auto">בקרוב: ניהול הגדרות, ייצוא/ייבוא נתונים, ועוד.</p>
-                        <div className="mt-8 inline-flex items-center gap-2 px-6 py-3 bg-gray-500 bg-opacity-10 border border-gray-500 border-opacity-30 rounded-xl text-gray-300">
-                            <i data-lucide="construction" className="w-5 h-5"></i>
-                            בפיתוח
-                        </div>
+                <div className="fade-in space-y-6">
+                    {/* Account Section */}
+                    <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-4 sm:p-6 border border-white border-opacity-10">
+                        <h3 className="text-lg font-bold text-white mb-4">חשבון</h3>
+                        {user ? (
+                            <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                    {user.photoURL && <img src={user.photoURL} className="w-10 h-10 rounded-full" alt="" />}
+                                    <div>
+                                        <div className="text-white font-medium">{user.displayName}</div>
+                                        <div className="text-gray-400 text-sm">{user.email}</div>
+                                    </div>
+                                </div>
+                                <button onClick={signOut} className="px-4 py-2 bg-red-500 bg-opacity-20 hover:bg-opacity-30 text-red-400 rounded-lg transition text-sm touch-manipulation">
+                                    התנתק
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="text-gray-400 text-sm">
+                                {firebaseReady ? 'לא מחובר - הנתונים נשמרים מקומית בלבד' : 'Firebase לא מוגדר - הנתונים נשמרים מקומית בלבד'}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Sync Section */}
+                    <div className="bg-white bg-opacity-5 backdrop-blur rounded-xl p-4 sm:p-6 border border-white border-opacity-10">
+                        <h3 className="text-lg font-bold text-white mb-4">סנכרון</h3>
+                        {firebaseReady ? (
+                            <div className="flex items-center gap-3">
+                                <div className="w-3 h-3 rounded-full bg-green-400"></div>
+                                <span className="text-green-400 text-sm">Firebase מוגדר ופעיל</span>
+                            </div>
+                        ) : (
+                            <div>
+                                <p className="text-gray-400 text-sm mb-3">כדי לסנכרן בין מכשירים, צריך להגדיר Firebase.</p>
+                                <button onClick={() => setShowSetup(true)} className="px-4 py-2 bg-indigo-500 hover:bg-indigo-600 text-white rounded-lg transition text-sm touch-manipulation">
+                                    הגדר סנכרון
+                                </button>
+                            </div>
+                        )}
                     </div>
                 </div>
             );
@@ -1148,6 +1278,7 @@
 
         // ===== MAIN DASHBOARD =====
         function Dashboard() {
+            const { user, loading, signInWithGoogle, signOut, firebaseReady } = useAuth();
             const [activePanel, setActivePanel] = useState(() => {
                 return localStorage.getItem('dashboard_activePanel') || 'tasks';
             });
@@ -1156,6 +1287,22 @@
             useEffect(() => {
                 localStorage.setItem('dashboard_activePanel', activePanel);
             }, [activePanel]);
+
+            // Show login screen only if Firebase is configured but user isn't logged in
+            if (loading) {
+                return (
+                    <div className="min-h-screen bg-gradient-to-br from-gray-950 via-gray-900 to-gray-950 flex items-center justify-center">
+                        <div className="text-center">
+                            <i data-lucide="loader-2" className="w-8 h-8 text-indigo-400 mx-auto spin-slow"></i>
+                            <p className="text-gray-400 mt-4">טוען...</p>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (firebaseReady && !user) {
+                return <LoginScreen />;
+            }
 
             const renderPanel = () => {
                 switch (activePanel) {
@@ -1173,10 +1320,7 @@
             return (
                 <div className="min-h-screen bg-gradient-to-br from-gray-950 via-gray-900 to-gray-950 flex">
                     {/* Desktop Sidebar */}
-                    <aside className={`sidebar-desktop fixed right-0 top-0 h-full z-30 transition-all duration-300 ${
-                        sidebarCollapsed ? 'w-16' : 'w-56'
-                    } bg-black bg-opacity-40 backdrop-blur-xl border-l border-white border-opacity-10`}>
-                        {/* Logo */}
+                    <aside className={`sidebar-desktop fixed right-0 top-0 h-full z-30 transition-all duration-300 ${sidebarCollapsed ? 'w-16' : 'w-56'} bg-black bg-opacity-40 backdrop-blur-xl border-l border-white border-opacity-10`}>
                         <div className="p-4 border-b border-white border-opacity-10">
                             <div className="flex items-center gap-3">
                                 <div className="flex-shrink-0 w-9 h-9 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center">
@@ -1191,30 +1335,29 @@
                             </div>
                         </div>
 
-                        {/* Nav Items */}
                         <nav className="p-2 space-y-1 mt-2">
                             {NAV_ITEMS.map(item => (
-                                <button
-                                    key={item.id}
-                                    onClick={() => setActivePanel(item.id)}
-                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all touch-manipulation ${
-                                        activePanel === item.id
-                                            ? 'nav-item-active text-white'
-                                            : 'text-gray-400 hover:text-white hover:bg-white hover:bg-opacity-5'
-                                    }`}
-                                >
+                                <button key={item.id} onClick={() => setActivePanel(item.id)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all touch-manipulation ${activePanel === item.id ? 'nav-item-active text-white' : 'text-gray-400 hover:text-white hover:bg-white hover:bg-opacity-5'}`}>
                                     <i data-lucide={item.icon} className={`w-5 h-5 flex-shrink-0 ${activePanel === item.id ? item.color : ''}`}></i>
                                     {!sidebarCollapsed && <span className="text-sm font-medium">{item.label}</span>}
                                 </button>
                             ))}
                         </nav>
 
-                        {/* Collapse Toggle */}
+                        {/* User info at bottom */}
+                        <div className="absolute bottom-12 left-0 right-0 px-2">
+                            {user && !sidebarCollapsed && (
+                                <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white bg-opacity-5">
+                                    {user.photoURL && <img src={user.photoURL} className="w-6 h-6 rounded-full flex-shrink-0" alt="" />}
+                                    <span className="text-xs text-gray-400 truncate">{user.displayName || user.email}</span>
+                                </div>
+                            )}
+                        </div>
+
                         <div className="absolute bottom-4 left-0 right-0 px-2">
-                            <button
-                                onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-                                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-gray-500 hover:text-white hover:bg-white hover:bg-opacity-5 transition touch-manipulation"
-                            >
+                            <button onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+                                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-gray-500 hover:text-white hover:bg-white hover:bg-opacity-5 transition touch-manipulation">
                                 <i data-lucide={sidebarCollapsed ? 'chevron-left' : 'chevron-right'} className="w-4 h-4"></i>
                                 {!sidebarCollapsed && <span className="text-xs">כווץ תפריט</span>}
                             </button>
@@ -1222,17 +1365,15 @@
                     </aside>
 
                     {/* Main Content */}
-                    <main className={`flex-1 transition-all duration-300 ${
-                        sidebarCollapsed ? 'md:mr-16' : 'md:mr-56'
-                    }`}>
-                        {/* Top Bar */}
+                    <main className={`flex-1 transition-all duration-300 ${sidebarCollapsed ? 'md:mr-16' : 'md:mr-56'}`}>
                         <header className="sticky top-0 z-20 bg-gray-950 bg-opacity-80 backdrop-blur-xl border-b border-white border-opacity-10">
                             <div className="px-4 sm:px-6 py-3 flex items-center justify-between">
                                 <div className="flex items-center gap-3">
                                     {activeNav && <i data-lucide={activeNav.icon} className={`w-5 h-5 ${activeNav.color}`}></i>}
                                     <h2 className="text-lg font-bold text-white">{activeNav?.label || 'לוח בקרה'}</h2>
                                 </div>
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-3">
+                                    <SyncIndicator />
                                     <div className="text-xs text-gray-500 hidden sm:block">
                                         {new Date().toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
                                     </div>
@@ -1240,7 +1381,6 @@
                             </div>
                         </header>
 
-                        {/* Content */}
                         <div className="p-4 sm:p-6 pb-24 md:pb-6">
                             {renderPanel()}
                         </div>
@@ -1250,20 +1390,11 @@
                     <nav className="mobile-bottom-nav fixed bottom-0 left-0 right-0 z-30 bg-gray-950 bg-opacity-95 backdrop-blur-xl border-t border-white border-opacity-10">
                         <div className="flex justify-around items-center py-2 px-2">
                             {NAV_ITEMS.map(item => (
-                                <button
-                                    key={item.id}
-                                    onClick={() => setActivePanel(item.id)}
-                                    className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all touch-manipulation ${
-                                        activePanel === item.id
-                                            ? 'text-white'
-                                            : 'text-gray-500'
-                                    }`}
-                                >
+                                <button key={item.id} onClick={() => setActivePanel(item.id)}
+                                    className={`flex flex-col items-center gap-0.5 px-3 py-1.5 rounded-xl transition-all touch-manipulation ${activePanel === item.id ? 'text-white' : 'text-gray-500'}`}>
                                     <i data-lucide={item.icon} className={`w-5 h-5 ${activePanel === item.id ? item.color : ''}`}></i>
                                     <span className="text-[10px] font-medium">{item.label}</span>
-                                    {activePanel === item.id && (
-                                        <div className={`w-1 h-1 rounded-full mt-0.5 ${item.color.replace('text-', 'bg-')}`}></div>
-                                    )}
+                                    {activePanel === item.id && (<div className={`w-1 h-1 rounded-full mt-0.5 ${item.color.replace('text-', 'bg-')}`}></div>)}
                                 </button>
                             ))}
                         </div>
@@ -1272,19 +1403,23 @@
             );
         }
 
+        // ===== APP ROOT =====
+        function App() {
+            return (
+                <AuthProvider>
+                    <Dashboard />
+                </AuthProvider>
+            );
+        }
+
         // Render
         const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<Dashboard />);
+        root.render(<App />);
 
         // Initialize Lucide icons
         lucide.createIcons();
-        const observer = new MutationObserver(() => {
-            lucide.createIcons();
-        });
-        observer.observe(document.getElementById('root'), {
-            childList: true,
-            subtree: true
-        });
+        const observer = new MutationObserver(() => { lucide.createIcons(); });
+        observer.observe(document.getElementById('root'), { childList: true, subtree: true });
     </script>
 </body>
 </html>
